@@ -19,23 +19,21 @@
       <aside class="panel auth-panel">
         <h2>Login</h2>
         <form id="loginForm">
-          <label>
-            Username
-            <input type="text" name="username" value="admin" required />
+          <label>Username
+            <input type="text" name="username" value="demo-admin" required />
           </label>
-          <label>
-            Password
-            <input type="password" name="password" value="AdminPass!2026" required />
+          <label>Password
+            <input type="password" name="password" value="DemoPass!2026" required />
           </label>
           <button type="submit">Sign in</button>
         </form>
         <p id="loginStatus" class="status"></p>
 
         <div class="demo-box">
-          <h3>SQL injection payloads</h3>
+          <h3>SQLi payloads</h3>
           <ul>
             <li><code>' OR '1'='1</code></li>
-            <li><code>%' AND SUBSTR((SELECT username FROM users LIMIT 1),1,1)='a' --</code></li>
+            <li><code>%' AND SUBSTR((SELECT username FROM users LIMIT 1),1,1)='d' --</code></li>
           </ul>
         </div>
       </aside>
@@ -46,7 +44,6 @@
             <h3>Patients</h3>
             <div id="patientList" class="list"></div>
           </div>
-
           <div class="card">
             <h3>Search notes</h3>
             <form id="searchForm">
@@ -60,7 +57,7 @@
         <div class="card">
           <h3>Clinical note</h3>
           <form id="noteForm">
-            <textarea id="noteText" rows="4" required><script>alert('Stored XSS')</script></textarea>
+            <textarea id="noteText" rows="4" required>&lt;img src=x onerror=alert('Stored XSS')&gt;</textarea>
             <button type="submit">Save note</button>
           </form>
           <div id="notesList" class="list"></div>

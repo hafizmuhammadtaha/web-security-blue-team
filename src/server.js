@@ -32,28 +32,14 @@ function sanitizeHtml(value) {
   return DOMPurify.sanitize(String(value ?? ""));
 }
 
-function hashPassword(password) {
-  const salt = crypto.randomBytes(16);
-  const derived = crypto.scryptSync(password, salt, 64);
-  return `${salt.toString("hex")}:${derived.toString("hex")}`;
-}
-
 function verifyPassword(password, storedHash) {
-  if (!storedHash || typeof storedHash !== "string") {
-    return false;
-  }
-
-  const separatorIndex = storedHash.indexOf(":");
-  if (separatorIndex === -1) {
-    return false;
-  }
-
-  const saltHex = storedHash.slice(0, separatorIndex);
-  const expectedHashHex = storedHash.slice(separatorIndex + 1);
-  const salt = Buffer.from(saltHex, "hex");
+  if (!storedHash || typeof storedHash !== "string") return false;
+  const sep = storedHash.indexOf(":");
+  if (sep === -1) return false;
+  const salt = Buffer.from(storedHash.slice(0, sep), "hex");
+  const expected = storedHash.slice(sep + 1);
   const derived = crypto.scryptSync(password, salt, 64).toString("hex");
-
-  return derived === expectedHashHex;
+  return derived === expected;
 }
 
 function generateCsrfToken() {
@@ -63,70 +49,15 @@ function generateCsrfToken() {
 }
 
 function validateCsrfToken(token) {
-  if (!token || !csrfTokens.has(token)) {
-    return false;
-  }
-
+  if (!token || !csrfTokens.has(token)) return false;
   csrfTokens.delete(token);
   return true;
 }
 
-function seedDemoAccounts() {
-  const rowCount = db.prepare("SELECT COUNT(*) AS total FROM users").get().total;
-  if (rowCount > 0) {
-    return;
-  }
-
-  const insertUser = db.prepare(`
-    INSERT INTO users (username, email, role)
-    VALUES (?, ?, ?)
-  `);
-
-  const insertCredential = db.prepare(`
-    INSERT INTO credentials (user_id, password_hash)
-    VALUES (?, ?)
-  `);
-
-  const insertPatient = db.prepare(`
-    INSERT INTO patients (patient_number, display_name, date_of_birth)
-    VALUES (?, ?, ?)
-  `);
-
-  const insertNote = db.prepare(`
-    INSERT INTO notes (patient_id, author_id, body)
-    VALUES (?, ?, ?)
-  `);
-
-  db.transaction(() => {
-    const users = [
-      { username: "admin", email: "admin@carehub.test", role: "admin", password: "AdminPass!2026" },
-      { username: "clinician", email: "clinician@carehub.test", role: "clinician", password: "ClinicianPass!2026" },
-      { username: "patient", email: "patient@carehub.test", role: "patient", password: "PatientPass!2026" }
-    ];
-
-    for (const user of users) {
-      insertUser.run(user.username, user.email, user.role);
-      const savedUser = db.prepare("SELECT id FROM users WHERE username = ?").get(user.username);
-      insertCredential.run(savedUser.id, hashPassword(user.password));
-    }
-
-    const patient = db.prepare("SELECT id FROM users WHERE username = ?").get("patient");
-    const clinician = db.prepare("SELECT id FROM users WHERE username = ?").get("clinician");
-
-    insertPatient.run("TRAINING-001", "Alex Example", "1980-01-01");
-    insertPatient.run("TRAINING-002", "Jordan Sample", "1990-06-15");
-
-    const patientRecord = db.prepare("SELECT id FROM patients WHERE patient_number = ?").get("TRAINING-001");
-    insertNote.run(patientRecord.id, clinician.id, "Synthetic training note. Do not use real patient information.");
-  })();
-}
-
-seedDemoAccounts();
-
+// ---------- Health ----------
 app.get("/api/health", (_req, res) => {
   try {
     const result = db.prepare("SELECT 1 AS database_ok").get();
-
     res.json({
       status: "ok",
       mode,
@@ -134,23 +65,24 @@ app.get("/api/health", (_req, res) => {
     });
   } catch (error) {
     console.error(error);
-    res.status(500).json({
-      status: "error",
-      mode,
-      database: "unavailable"
-    });
+    res.status(500).json({ status: "error", mode, database: "unavailable" });
   }
 });
 
+// ---------- CSRF token ----------
 app.get("/api/csrf-token", (_req, res) => {
   res.json({ token: generateCsrfToken() });
 });
 
+// ---------- Patients ----------
 app.get("/api/patients", (_req, res) => {
-  const rows = db.prepare("SELECT id, patient_number, display_name, date_of_birth FROM patients ORDER BY display_name ASC").all();
+  const rows = db.prepare(
+    "SELECT id, patient_number, display_name, date_of_birth FROM patients ORDER BY display_name ASC"
+  ).all();
   res.json(rows);
 });
 
+// ---------- Notes (Stored XSS + Reflected XSS) ----------
 app.get("/api/notes", (_req, res) => {
   const rows = db.prepare(`
     SELECT n.id, n.body, n.created_at, p.display_name AS patient_name, u.username AS author_name
@@ -167,45 +99,33 @@ app.get("/api/notes", (_req, res) => {
   })));
 });
 
-app.post("/api/login", (req, res) => {
-  const username = String(req.body.username ?? "");
-  const password = String(req.body.password ?? "");
+app.post("/api/notes", (req, res) => {
+  const noteText = String(req.body.text ?? "");
+  const author = db.prepare("SELECT id FROM users WHERE username = ?").get("demo-clinician");
+  const patient = db.prepare("SELECT id FROM patients WHERE patient_number = ?").get("TRAINING-001");
 
-  if (mode === "vulnerable") {
-    const sql = `SELECT u.id, u.username, u.email, u.role FROM users u WHERE u.username = '${username}'`;
-    const row = db.prepare(sql).get();
-
-    if (!row) {
-      return res.status(401).json({ success: false, error: "Invalid username or password." });
-    }
-
-    return res.json({ success: true, user: { id: row.id, username: row.username, email: row.email, role: row.role } });
+  if (!author || !patient) {
+    return res.status(500).json({ error: "Missing demo data." });
   }
 
-  const row = db.prepare(`
-    SELECT u.id, u.username, u.email, u.role, c.password_hash
-    FROM users u
-    JOIN credentials c ON c.user_id = u.id
-    WHERE u.username = ?
-  `).get(username);
+  const storedValue = mode === "vulnerable" ? noteText : sanitizeHtml(noteText);
 
-  if (!row || !verifyPassword(password, row.password_hash)) {
-    return res.status(401).json({ success: false, error: "Invalid username or password." });
-  }
+  db.prepare(`
+    INSERT INTO notes (patient_id, author_id, body)
+    VALUES (?, ?, ?)
+  `).run(patient.id, author.id, storedValue);
 
-  res.json({ success: true, user: { id: row.id, username: row.username, email: row.email, role: row.role } });
+  res.json({ success: true, stored: storedValue });
 });
 
+// ---------- Search (Reflected XSS) ----------
 app.get("/api/search", (req, res) => {
   const query = String(req.query.q ?? "");
 
   if (mode === "vulnerable") {
     return res.json({
       query,
-      results: [{
-        patient_name: "Reflected XSS demo",
-        body: query
-      }]
+      results: [{ patient_name: "Reflected XSS demo", body: query }]
     });
   }
 
@@ -219,32 +139,37 @@ app.get("/api/search", (req, res) => {
 
   res.json({
     query,
-    results: results.map((row) => ({
-      ...row,
-      body: sanitizeHtml(row.body)
-    }))
+    results: results.map((row) => ({ ...row, body: sanitizeHtml(row.body) }))
   });
 });
 
-app.post("/api/notes", (req, res) => {
-  const noteText = String(req.body.text ?? "");
-  const author = db.prepare("SELECT id FROM users WHERE username = ?").get("clinician");
-  const patient = db.prepare("SELECT id FROM patients WHERE patient_number = ?").get("TRAINING-001");
+// ---------- Login (SQLi Easy) ----------
+app.post("/api/login", (req, res) => {
+  const username = String(req.body.username ?? "");
+  const password = String(req.body.password ?? "");
 
-  if (!author || !patient) {
-    return res.status(500).json({ error: "Missing demo patient data." });
+  if (mode === "vulnerable") {
+    const sql = `SELECT u.id, u.username, u.email, u.role FROM users u WHERE u.username = '${username}'`;
+    const row = db.prepare(sql).get();
+    if (!row) return res.status(401).json({ success: false, error: "Invalid credentials." });
+    return res.json({ success: true, user: { id: row.id, username: row.username, email: row.email, role: row.role } });
   }
 
-  const storedValue = mode === "vulnerable" ? noteText : sanitizeHtml(noteText);
+  const row = db.prepare(`
+    SELECT u.id, u.username, u.email, u.role, c.password_hash
+    FROM users u
+    JOIN credentials c ON c.user_id = u.id
+    WHERE u.username = ?
+  `).get(username);
 
-  db.prepare(`
-    INSERT INTO notes (patient_id, author_id, body)
-    VALUES (?, ?, ?)
-  `).run(patient.id, author.id, storedValue);
+  if (!row || !verifyPassword(password, row.password_hash)) {
+    return res.status(401).json({ success: false, error: "Invalid credentials." });
+  }
 
-  res.json({ success: true, stored: storedValue });
+  res.json({ success: true, user: { id: row.id, username: row.username, email: row.email, role: row.role } });
 });
 
+// ---------- Change Email (CSRF) ----------
 app.post("/api/change-email", (req, res) => {
   const newEmail = String(req.body.email ?? "");
 
@@ -255,7 +180,7 @@ app.post("/api/change-email", (req, res) => {
     }
   }
 
-  const user = db.prepare("SELECT id FROM users WHERE username = ?").get("admin");
+  const user = db.prepare("SELECT id FROM users WHERE username = ?").get("demo-admin");
   if (user) {
     db.prepare("UPDATE users SET email = ? WHERE id = ?").run(newEmail, user.id);
   }
@@ -263,6 +188,24 @@ app.post("/api/change-email", (req, res) => {
   return res.json({ success: true, email: newEmail });
 });
 
+// ---------- SQLi Easy ----------
+app.get("/api/sql-easy", (req, res) => {
+  const username = String(req.query.username ?? "");
+
+  if (mode === "vulnerable") {
+    const sql = `SELECT id, username, email, role FROM users WHERE username = '${username}'`;
+    const rows = db.prepare(sql).all();
+    return res.json({ mode, sql, rows });
+  }
+
+  const rows = db.prepare(`
+    SELECT id, username, email, role FROM users WHERE username = ?
+  `).all(username);
+
+  res.json({ mode, sql: "SELECT id, username, email, role FROM users WHERE username = ?", rows });
+});
+
+// ---------- SQLi Intermediate ----------
 app.get("/api/sql-intermediate", (req, res) => {
   const name = String(req.query.name ?? "");
 
@@ -273,14 +216,13 @@ app.get("/api/sql-intermediate", (req, res) => {
   }
 
   const rows = db.prepare(`
-    SELECT id, display_name, date_of_birth
-    FROM patients
-    WHERE display_name LIKE ?
+    SELECT id, display_name, date_of_birth FROM patients WHERE display_name LIKE ?
   `).all(`%${name}%`);
 
-  res.json({ mode, sql: "SELECT id, display_name, date_of_birth FROM patients WHERE display_name LIKE ?", rows });
+  res.json({ mode, sql: "SELECT ... WHERE display_name LIKE ?", rows });
 });
 
+// ---------- SQLi Advanced ----------
 app.get("/api/sql-advanced", (req, res) => {
   const stage = String(req.query.stage ?? "tables");
   const table = String(req.query.table ?? "users");
@@ -290,12 +232,10 @@ app.get("/api/sql-advanced", (req, res) => {
       const sql = "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name";
       return res.json({ mode, stage, sql, rows: db.prepare(sql).all() });
     }
-
     if (stage === "columns") {
       const sql = `PRAGMA table_info(${table})`;
       return res.json({ mode, stage, table, sql, rows: db.prepare(sql).all() });
     }
-
     const sql = `SELECT * FROM ${table} LIMIT 5`;
     return res.json({ mode, stage: "data", table, sql, rows: db.prepare(sql).all() });
   }
@@ -316,24 +256,7 @@ app.get("/api/sql-advanced", (req, res) => {
   res.json({ mode, stage, table, sql, rows });
 });
 
-app.get("/api/sql-easy", (req, res) => {
-  const username = String(req.query.username ?? "");
-
-  if (mode === "vulnerable") {
-    const sql = `SELECT id, username, email, role FROM users WHERE username = '${username}'`;
-    const rows = db.prepare(sql).all();
-    return res.json({ mode, sql, rows });
-  }
-
-  const rows = db.prepare(`
-    SELECT id, username, email, role
-    FROM users
-    WHERE username = ?
-  `).all(username);
-
-  res.json({ mode, sql: "SELECT id, username, email, role FROM users WHERE username = ?", rows });
-});
-
+// ---------- Pages ----------
 app.get("/", (_req, res) => {
   res.sendFile(path.join(__dirname, "..", "public", "index.html"));
 });
